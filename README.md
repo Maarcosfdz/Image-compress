@@ -57,6 +57,13 @@ Install the required dependency with:
 ```bash
 pip install pillow
 ```
+## To run 
+
+Bash command (you need to be on the folder)
+
+```bash
+python script.py
+```
 
 ## Folder structure
 
