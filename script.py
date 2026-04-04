@@ -1,18 +1,19 @@
 from pathlib import Path
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageSequence
 
 INPUT_DIR = Path("in")
 OUTPUT_DIR = Path("out")
 
 # Allowed input formats
-INPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+INPUT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".gif"}
 
 # Output format:
 # "same"  -> keep the original format when possible
 # "jpeg"  -> convert everything to jpg
 # "png"   -> convert everything to png
 # "webp"  -> convert everything to webp
+# "gif"   -> convert everything to gif
 OUTPUT_FORMAT = "same"
 
 # Reduce size by half
@@ -46,6 +47,7 @@ def normalize_format(ext: str) -> str:
         ".webp": "webp",
         ".bmp": "bmp",
         ".tiff": "tiff",
+        ".gif": "gif",
     }
     return mapping.get(ext, "png")
 
@@ -63,6 +65,7 @@ def get_output_extension(fmt: str) -> str:
         "webp": ".webp",
         "bmp": ".bmp",
         "tiff": ".tiff",
+        "gif": ".gif",
     }
     return mapping[fmt]
 
@@ -80,7 +83,7 @@ def prepare_image_for_format(img: Image.Image, out_format: str) -> Image.Image:
             return background
         return img.convert("RGB")
 
-    if out_format in ("png", "webp", "tiff"):
+    if out_format in ("png", "webp", "tiff", "gif"):
         if img.mode not in ("RGB", "RGBA"):
             return img.convert("RGBA")
         return img
@@ -123,6 +126,12 @@ def save_to_bytes(img: Image.Image, out_format: str, quality: int | None = None)
     elif out_format == "tiff":
         img.save(buffer, format="TIFF", compression="tiff_deflate")
 
+    elif out_format == "gif":
+        gif_img = img
+        if gif_img.mode != "P":
+            gif_img = gif_img.convert("P", palette=Image.Palette.ADAPTIVE, colors=256)
+        gif_img.save(buffer, format="GIF", optimize=True)
+
     else:
         raise ValueError(f"Formato no soportado: {out_format}")
 
@@ -151,6 +160,69 @@ def quantize_png_if_needed(img: Image.Image) -> bytes:
     return best_data
 
 
+def save_animated_gif_to_bytes(
+    frames: list[Image.Image],
+    durations: list[int],
+    loop: int,
+    colors: int,
+) -> bytes:
+    paletted_frames = [
+        frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors)
+        for frame in frames
+    ]
+
+    buffer = BytesIO()
+    paletted_frames[0].save(
+        buffer,
+        format="GIF",
+        save_all=True,
+        append_images=paletted_frames[1:],
+        duration=durations,
+        loop=loop,
+        optimize=True,
+        disposal=2,
+    )
+    return buffer.getvalue()
+
+
+def compress_animated_gif(img: Image.Image, scale: float) -> bytes:
+    frames: list[Image.Image] = []
+    durations: list[int] = []
+
+    default_duration = int(img.info.get("duration", 100))
+    loop = int(img.info.get("loop", 0))
+
+    for frame in ImageSequence.Iterator(img):
+        rgba_frame = frame.convert("RGBA")
+        if scale != 1.0:
+            rgba_frame = resize_image(rgba_frame, scale)
+        frames.append(rgba_frame)
+        durations.append(int(frame.info.get("duration", default_duration)))
+
+    if not frames:
+        base = img.convert("RGBA")
+        if scale != 1.0:
+            base = resize_image(base, scale)
+        frames = [base]
+        durations = [default_duration]
+
+    best_data = None
+    best_size = float("inf")
+
+    for colors in [256, 128, 64, 32, 16]:
+        data = save_animated_gif_to_bytes(frames, durations, loop, colors)
+        size = get_size_kb_from_bytes(data)
+
+        if size < best_size:
+            best_data = data
+            best_size = size
+
+        if size <= TARGET_SIZE_KB:
+            return data
+
+    return best_data
+
+
 def compress_image(img: Image.Image, out_format: str) -> bytes:
     """
     Attempts to get a file below the target size.
@@ -162,6 +234,24 @@ def compress_image(img: Image.Image, out_format: str) -> bytes:
 
     if out_format == "png":
         return quantize_png_if_needed(img)
+
+    if out_format == "gif":
+        best_data = save_to_bytes(img, "gif")
+        best_size = get_size_kb_from_bytes(best_data)
+
+        for colors in [256, 128, 64, 32, 16]:
+            test_img = img.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors)
+            data = save_to_bytes(test_img, "gif")
+            size = get_size_kb_from_bytes(data)
+
+            if size < best_size:
+                best_data = data
+                best_size = size
+
+            if size <= TARGET_SIZE_KB:
+                return data
+
+        return best_data
 
     if out_format in ("jpeg", "webp"):
         best_data = None
@@ -198,14 +288,25 @@ def process_file(input_path: Path) -> None:
         img.load()
 
         current_scale = SCALE_FACTOR
-        resized = resize_image(img, current_scale)
-        best_data = compress_image(resized, out_format)
+        is_animated_gif = out_format == "gif" and bool(getattr(img, "is_animated", False))
+
+        if is_animated_gif:
+            best_data = compress_animated_gif(img, current_scale)
+        else:
+            resized = resize_image(img, current_scale)
+            best_data = compress_image(resized, out_format)
+
         best_size = get_size_kb_from_bytes(best_data)
 
         while best_size > TARGET_SIZE_KB and current_scale > MIN_SCALE_FACTOR:
             current_scale *= 0.85
-            resized = resize_image(img, current_scale)
-            data = compress_image(resized, out_format)
+
+            if is_animated_gif:
+                data = compress_animated_gif(img, current_scale)
+            else:
+                resized = resize_image(img, current_scale)
+                data = compress_image(resized, out_format)
+
             size = get_size_kb_from_bytes(data)
 
             if size < best_size:
